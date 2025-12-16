@@ -1,8 +1,6 @@
+#!/usr/bin/env python3
 """
 SimCLR baseline
-
-Run environment requirements:
-  pip install torch torchaudio librosa numpy pandas scikit-learn umap-learn matplotlib tqdm soundfile
 """
 import os
 import time
@@ -25,7 +23,7 @@ from torch.utils.data import Dataset, DataLoader
 import torchaudio
 import torchaudio.transforms as T
 
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import SGDClassifier
 from sklearn.metrics import accuracy_score, f1_score, roc_curve
 from sklearn.model_selection import train_test_split
 
@@ -42,10 +40,10 @@ N_MELS = 64
 WIN_LENGTH = 400
 HOP_LENGTH = 160
 
-BATCH_SIZE = 128
-EMBED_DIM = 512      
+BATCH_SIZE = 256
+EMBED_DIM = 512      # confirmed by you
 PROJ_DIM = 128
-EPOCHS = 3
+EPOCHS = 10
 LR = 1e-3
 TEMPERATURE = 0.07
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -91,7 +89,7 @@ metadata['full_path'] = metadata['path'].apply(lambda p: str(CLIPS_DIR / p))
 metadata = metadata[metadata['full_path'].apply(lambda p: os.path.exists(p))]
 print('After filtering missing files:', len(metadata))
 
-# collapse age groups (young, adult, mature, senior)
+# collapse age groups
 def collapse_age(age):
     if pd.isna(age):
         return 'unknown'
@@ -108,7 +106,7 @@ def collapse_age(age):
 
 metadata['age_group'] = metadata['age'].apply(collapse_age)
 
-# mapping accents into groups (usa, england, other_uk, canada, australia_nz, india_south_asia, other)
+# mapping accents into groups
 def map_accent_to_7(acc):
     if pd.isna(acc) or str(acc).strip() == "":
         return "unknown"
@@ -148,48 +146,63 @@ metadata.loc[metadata['speaker_id'].isin(test_spk), 'split'] = 'test'
 
 metadata.to_csv(OUTPUT_DIR / 'commonvoice_metadata_processed.csv', index=False)
 
-# --------------------
-# Audio augmentations and dataset
-# --------------------
-class AudioAugment:
-    def __init__(self, sample_rate=16000):
-        self.sample_rate = sample_rate
-        self.noise_levels = (0.0, 0.5)
-        self.pitch_shift_steps = (-2, 2)
+class SpecAugment(nn.Module):
+    """
+    SpecAugment for log-Mel spectrograms.
+    Input shape: [1, n_mels, time]
+    """
+    def __init__(
+        self,
+        time_mask_param=30,
+        freq_mask_param=8,
+        num_time_masks=2,
+        num_freq_masks=2,
+        p=1.0
+    ):
+        super().__init__()
+        self.p = p
+        self.time_masks = nn.ModuleList(
+            [T.TimeMasking(time_mask_param) for _ in range(num_time_masks)]
+        )
+        self.freq_masks = nn.ModuleList(
+            [T.FrequencyMasking(freq_mask_param) for _ in range(num_freq_masks)]
+        )
 
-    def random_crop_or_pad(self, waveform, target_len):
-        T = waveform.shape[-1]
-        if T > target_len:
-            start = random.randint(0, T - target_len)
-            return waveform[:, start:start + target_len]
-        elif T < target_len:
-            pad = target_len - T
-            left = random.randint(0, pad)
-            right = pad - left
-            return F.pad(waveform, (left, right))
-        return waveform
+    def forward(self, spec):
+        if torch.rand(1).item() > self.p:
+            return spec
 
-    def add_noise(self, waveform):
-        rms = waveform.abs().mean()
-        scale = random.uniform(0.0, 0.5)
-        noise = torch.randn_like(waveform) * rms * scale
-        return waveform + noise
-
-    def __call__(self, waveform, target_len):
-        w = self.random_crop_or_pad(waveform, target_len)
-        if random.random() < 0.5:
-            w = self.add_noise(w)
-        return w
+        for tm in self.time_masks:
+            spec = tm(spec)
+        for fm in self.freq_masks:
+            spec = fm(spec)
+        return spec
 
 class SimCLRCommonVoiceDataset(Dataset):
-    def __init__(self, df, clips_dir, split='train', sample_rate=16000, duration=3.0, transforms=None):
+    def __init__(
+        self,
+        df,
+        clips_dir,
+        split='train',
+        sample_rate=16000,
+        duration=3.0,
+        apply_specaug=True
+    ):
         self.df = df[df['split'] == split].reset_index(drop=True)
         self.clips_dir = clips_dir
         self.sample_rate = sample_rate
         self.target_len = int(duration * sample_rate)
-        self.transforms = transforms if transforms is not None else AudioAugment(sample_rate)
-        self.mel = T.MelSpectrogram(sample_rate=sample_rate, n_fft=512, win_length=WIN_LENGTH, hop_length=HOP_LENGTH, n_mels=N_MELS)
+
+        self.mel = T.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=512,
+            win_length=WIN_LENGTH,
+            hop_length=HOP_LENGTH,
+            n_mels=N_MELS
+        )
         self.amplitude_to_db = T.AmplitudeToDB()
+
+        self.specaug = SpecAugment() if apply_specaug and split == 'train' else None
 
     def __len__(self):
         return len(self.df)
@@ -198,38 +211,61 @@ class SimCLRCommonVoiceDataset(Dataset):
         wav, sr = sf.read(path, dtype='float32')
         if wav.ndim > 1:
             wav = wav.mean(axis=1)
+
         if sr != self.sample_rate:
             wav = librosa.resample(wav, orig_sr=sr, target_sr=self.sample_rate)
-            sr = self.sample_rate
-        if wav.dtype != np.float32:
-            wav = wav.astype(np.float32)
-        return torch.from_numpy(wav).unsqueeze(0)
+
+        wav = torch.from_numpy(wav)
+
+        # random crop or pad (simple + fast)
+        if wav.numel() > self.target_len:
+            start = torch.randint(0, wav.numel() - self.target_len + 1, (1,)).item()
+            wav = wav[start:start + self.target_len]
+        else:
+            pad = self.target_len - wav.numel()
+            wav = F.pad(wav, (0, pad))
+
+        return wav.unsqueeze(0)  # [1, T]
 
     def waveform_to_mel(self, waveform):
-        spec = self.mel(waveform)  # shape: [1, n_mels, time] when input is [1, T]
+        spec = self.mel(waveform)          # [1, n_mels, time]
         spec = self.amplitude_to_db(spec)
         spec = (spec - spec.mean()) / (spec.std() + 1e-6)
-        # make shape [n_mels, time]
-        if spec.ndim == 3:
-            spec = spec.squeeze(0)
         return spec
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         waveform = self.load_audio(row['full_path'])
-        w1 = self.transforms(waveform, self.target_len)
-        w2 = self.transforms(waveform, self.target_len)
-        s1 = self.waveform_to_mel(w1)
-        s2 = self.waveform_to_mel(w2)
-        # return spectrograms and metadata
-        return s1, s2, row['speaker_id'], row['gender'], row['age_group'], row['accent_group'], row.get('sentence', "")
+
+        s1 = self.waveform_to_mel(waveform)
+        s2 = self.waveform_to_mel(waveform)
+
+        if self.specaug is not None:
+            s1 = self.specaug(s1)
+            s2 = self.specaug(s2)
+
+        return (
+            s1.squeeze(0),  # [n_mels, time]
+            s2.squeeze(0),
+            row['speaker_id'],
+            row['gender'],
+            row['age_group'],
+            row['accent_group'],
+            row.get('sentence', "")
+        )
 
 def collate_fn(batch):
-    s1 = [b[0] for b in batch]
-    s2 = [b[1] for b in batch]
-    s1 = torch.stack([s for s in s1], dim=0).unsqueeze(1).float()
-    s2 = torch.stack([s for s in s2], dim=0).unsqueeze(1).float()
-    return s1, s2, [b[2] for b in batch], [b[3] for b in batch], [b[4] for b in batch], [b[5] for b in batch], [b[6] for b in batch]
+    s1 = torch.stack([b[0] for b in batch]).unsqueeze(1).float()
+    s2 = torch.stack([b[1] for b in batch]).unsqueeze(1).float()
+    return (
+        s1,
+        s2,
+        [b[2] for b in batch],
+        [b[3] for b in batch],
+        [b[4] for b in batch],
+        [b[5] for b in batch],
+        [b[6] for b in batch],
+    )
 
 # --------------------
 # Encoder & projection head
@@ -270,15 +306,21 @@ class SmallCNNEncoder(nn.Module):
         return z
 
 class ProjectionHead(nn.Module):
-    def __init__(self, in_dim=EMBED_DIM, proj_dim=PROJ_DIM):
+    def __init__(self, in_dim=512, proj_dim=128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, in_dim),
+            nn.BatchNorm1d(in_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(in_dim, proj_dim)
+            nn.Linear(in_dim, in_dim),
+            nn.BatchNorm1d(in_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_dim, proj_dim),
         )
+
     def forward(self, x):
         return self.net(x)
+
 
 def nt_xent_loss(z1, z2, temperature=TEMPERATURE):
     batch_size = z1.size(0)
@@ -295,11 +337,33 @@ def nt_xent_loss(z1, z2, temperature=TEMPERATURE):
 # --------------------
 # DataLoaders for SimCLR training (train/val)
 # --------------------
-train_dataset = SimCLRCommonVoiceDataset(metadata, CLIPS_DIR, split='train', sample_rate=SAMPLE_RATE, duration=DURATION)
-val_dataset = SimCLRCommonVoiceDataset(metadata, CLIPS_DIR, split='val', sample_rate=SAMPLE_RATE, duration=DURATION, transforms=AudioAugment(SAMPLE_RATE))
+train_dataset = SimCLRCommonVoiceDataset(
+    metadata, CLIPS_DIR, split='train', sample_rate=SAMPLE_RATE, duration=DURATION
+)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, collate_fn=collate_fn, drop_last=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, collate_fn=collate_fn)
+val_dataset = SimCLRCommonVoiceDataset(
+    metadata, CLIPS_DIR, split='val', sample_rate=SAMPLE_RATE, duration=DURATION, apply_specaug=False
+)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True,
+    drop_last=True,
+    collate_fn=collate_fn
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=4,
+    pin_memory=True,
+    collate_fn=collate_fn
+)
+
 
 encoder = SmallCNNEncoder(embed_dim=EMBED_DIM).to(DEVICE)
 proj = ProjectionHead(in_dim=EMBED_DIM, proj_dim=PROJ_DIM).to(DEVICE)
@@ -336,14 +400,14 @@ for epoch in range(EPOCHS):
     print(f'Validation loss: {val_loss:.4f}')
 
     torch.save({'encoder': encoder.state_dict(), 'proj': proj.state_dict(), 'epoch': epoch}, OUTPUT_DIR / f'checkpoint_epoch_{epoch}.pt')
-
+    
 # --------------------
 # Embedding extraction (train/val/test)
 # --------------------
 encoder.eval()
 
 def extract_embeddings_for_split(df_split, split_name, batch_size=128):
-    ds = SimCLRCommonVoiceDataset(df_split, CLIPS_DIR, split=split_name, sample_rate=SAMPLE_RATE, duration=DURATION, transforms=None)
+    ds = SimCLRCommonVoiceDataset(df_split, CLIPS_DIR, split=split_name, sample_rate=SAMPLE_RATE, duration=DURATION, apply_specaug=False)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=4, collate_fn=collate_fn)
     embeddings = []
     speakers = []
@@ -381,17 +445,23 @@ np.savez_compressed(OUTPUT_DIR / 'embeddings_test.npz', emb=emb_test, spk=spk_te
 # --------------------
 # Utility probes & helpers
 # --------------------
-def train_probe(X_train, y_train, X_test, y_test, multiclass=True):
-    le_train = [str(x) for x in y_train]
-    le_test = [str(x) for x in y_test]
-    # if there are no classes / samples return None
-    if len(X_train) == 0 or len(X_test) == 0:
-        return {'acc': None, 'f1_macro': None, 'clf': None}
-    clf = LogisticRegression(max_iter=2000, class_weight='balanced', multi_class='ovr', solver='saga')
-    clf.fit(X_train, le_train)
-    y_pred = clf.predict(X_test)
-    acc = accuracy_score(le_test, y_pred)
-    f1 = f1_score(le_test, y_pred, average='macro')
+def train_probe_and_report(X_tr, y_tr, X_te, y_te):
+    # map labels to str
+    y_tr = [str(x) for x in y_tr]
+    y_te = [str(x) for x in y_te]
+    if X_tr.shape[0] == 0 or X_te.shape[0] == 0:
+        return {'acc': None, 'f1_macro': None}
+    # Fast and scalable classifier for huge numbers of classes
+    clf = SGDClassifier(
+        loss="log_loss",      # logistic regression (softmax-like)
+        max_iter=30,     
+        tol=1e-3,
+        n_jobs=-1        
+    )
+    clf.fit(X_tr, y_tr)
+    y_pred = clf.predict(X_te)
+    acc = accuracy_score(y_te, y_pred)
+    f1 = f1_score(y_te, y_pred, average='macro')
     return {'acc': acc, 'f1_macro': f1, 'clf': clf}
 
 def avg_by_speaker(emb, spk, label):
@@ -414,7 +484,7 @@ def avg_by_speaker(emb, spk, label):
         return np.zeros((0, EMBED_DIM)), [], []
     X = np.stack(X, axis=0)
     return X, Y, S
-
+    
 # --------------------
 # CLOSED-SET speaker-ID probe (fix): within-train per-speaker split
 # --------------------
@@ -452,7 +522,7 @@ print("Closed-set probe: #train utterances:", X_train_utt.shape[0], "#test utter
 print("Unique speakers in closed-set probe (train):", len(set(y_train_utt)), "held-out speakers:", len(set(y_test_utt)))
 print("Intersection (should be >0):", len(set(y_train_utt).intersection(set(y_test_utt))))
 
-res_speaker_utt = train_probe(X_train_utt, y_train_utt, X_test_utt, y_test_utt)
+res_speaker_utt = train_probe_and_report(X_train_utt, y_train_utt, X_test_utt, y_test_utt)
 print("Speaker ID probe (utterance-level closed-set):", res_speaker_utt)
 
 # Per-speaker average closed-set: average train utterances per speaker and test utterances per speaker
@@ -474,7 +544,7 @@ X_train_spk_avg, y_train_spk_avg = avg_by_speaker_from_indices(emb_train, spk_tr
 X_test_spk_avg, y_test_spk_avg = avg_by_speaker_from_indices(emb_train, spk_train, test_idxs)
 
 print("Closed-set per-speaker avg: #train speakers:", X_train_spk_avg.shape[0], "#test speakers:", X_test_spk_avg.shape[0])
-res_speaker_spkavg = train_probe(X_train_spk_avg, y_train_spk_avg, X_test_spk_avg, y_test_spk_avg)
+res_speaker_spkavg = train_probe_and_report(X_train_spk_avg, y_train_spk_avg, X_test_spk_avg, y_test_spk_avg)
 print("Speaker ID probe (per-speaker average closed-set):", res_speaker_spkavg)
 
 # --------------------
@@ -482,25 +552,63 @@ print("Speaker ID probe (per-speaker average closed-set):", res_speaker_spkavg)
 # --------------------
 print('\n=== Attribute probes (train speakers -> test speakers) ===')
 
-# Build speaker-averaged embeddings for train speakers (for training probes)
-X_train_spk_attr, y_gender_train_spk, _ = avg_by_speaker(emb_train, spk_train, gen_train)
+def filter_valid_labels(X, y, invalid_labels):
+    mask = [yy not in invalid_labels for yy in y]
+    X = X[mask]
+    y = [yy for yy in y if yy not in invalid_labels]
+    return X, y
+
+# ---- Build speaker-averaged embeddings ----
+
+# Train speakers
+X_train_spk_gender, y_gender_train_spk, _ = avg_by_speaker(emb_train, spk_train, gen_train)
 X_train_spk_age, y_age_train_spk, _ = avg_by_speaker(emb_train, spk_train, age_train)
 X_train_spk_acc, y_acc_train_spk, _ = avg_by_speaker(emb_train, spk_train, acc_train)
 
-# Build speaker-averaged embeddings for test speakers (for evaluating probes)
-X_test_spk_attr, y_gender_test_spk, _ = avg_by_speaker(emb_test, spk_test, gen_test)
+# Test speakers
+X_test_spk_gender, y_gender_test_spk, _ = avg_by_speaker(emb_test, spk_test, gen_test)
 X_test_spk_age, y_age_test_spk, _ = avg_by_speaker(emb_test, spk_test, age_test)
 X_test_spk_acc, y_acc_test_spk, _ = avg_by_speaker(emb_test, spk_test, acc_test)
 
-res_gender = train_probe(X_train_spk_attr, y_gender_train_spk, X_test_spk_attr, y_gender_test_spk)
+# ---- Gender probe ----
+Xtr, ytr = filter_valid_labels(
+    X_train_spk_gender, y_gender_train_spk,
+    invalid_labels=("unknown",)
+)
+Xte, yte = filter_valid_labels(
+    X_test_spk_gender, y_gender_test_spk,
+    invalid_labels=("unknown",)
+)
+res_gender = train_probe_and_report(Xtr, ytr, Xte, yte)
 print('Gender probe (train-spk -> test-spk):', res_gender)
-res_age = train_probe(X_train_spk_age, y_age_train_spk, X_test_spk_age, y_age_test_spk)
+
+# ---- Age-group probe ----
+Xtr, ytr = filter_valid_labels(
+    X_train_spk_age, y_age_train_spk,
+    invalid_labels=("unknown",)
+)
+Xte, yte = filter_valid_labels(
+    X_test_spk_age, y_age_test_spk,
+    invalid_labels=("unknown",)
+)
+res_age = train_probe_and_report(Xtr, ytr, Xte, yte)
 print('Age-group probe (train-spk -> test-spk):', res_age)
-res_acc = train_probe(X_train_spk_acc, y_acc_train_spk, X_test_spk_acc, y_acc_test_spk)
+
+# ---- Accent probe ----
+# Exclude heterogeneous "other" and missing labels
+Xtr, ytr = filter_valid_labels(
+    X_train_spk_acc, y_acc_train_spk,
+    invalid_labels=("unknown", "other")
+)
+Xte, yte = filter_valid_labels(
+    X_test_spk_acc, y_acc_test_spk,
+    invalid_labels=("unknown", "other")
+)
+res_acc = train_probe_and_report(Xtr, ytr, Xte, yte)
 print('Accent probe (train-spk -> test-spk):', res_acc)
 
 # --------------------
-# OPEN-SET speaker verification (EER)
+# OPEN-SET speaker verification (EER) - unchanged logic but uses emb_test (unseen speakers)
 # --------------------
 print('\n=== OPEN-SET speaker verification (EER) on TEST set ===')
 def build_trials_for_embeddings(emb, spk, gender, age, accent, max_pos_per_spk=50, max_neg_per_spk=50):
@@ -604,5 +712,7 @@ with open(OUTPUT_DIR / 'evaluation_summary.json', 'w') as f:
     json.dump(summary, f, indent=2)
 
 toc = time.perf_counter()
-print(f"\n Done. Results and embeddings saved under: {OUTPUT_DIR}")
-print(f"⏱️ Total time: {toc - tic:0.2f} seconds")
+seconds = toc - tic
+print(f"\n✅ Done. Results and embeddings saved under: {OUTPUT_DIR}")
+print(f"⏱️ Total time: {seconds:0.2f} seconds")
+print(f"Total time: {seconds//3600:0.2f} hours {seconds%3600//60:0.2f} minutes")

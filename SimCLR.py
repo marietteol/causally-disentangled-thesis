@@ -30,34 +30,96 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import json
 
-# -------- CONFIG --------
+#!/usr/bin/env python3
+"""
+SimCLR-based self-supervised learning pipeline for speech representations
+======================================================================
+
+This script implements a *fully documented* SimCLR baseline for speech
+representation learning on Mozilla Common Voice. The goal is to learn
+speaker-discriminative embeddings while later evaluating demographic
+leakage via probing classifiers and speaker verification.
+
+High-level pipeline:
+--------------------
+1. Load and preprocess Common Voice metadata and audio.
+2. Split speakers into train / validation / test (speaker-disjoint).
+3. Train a SimCLR model using spectrogram augmentations.
+4. Extract fixed-dimensional embeddings for all splits.
+5. Evaluate:
+   - Closed-set speaker identification (within train speakers)
+   - Attribute probes (gender, age, accent)
+   - Open-set speaker verification (EER)
+
+All major sections are heavily commented so the code is readable
+without prior context.
+"""
+
+# ============================================================
+# Imports
+# ============================================================
+
+import os
+import time
+import random
+from pathlib import Path
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+
+import soundfile as sf
+import librosa
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import torchaudio.transforms as T
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import accuracy_score, f1_score, roc_curve
+
+from tqdm import tqdm
+import json
+
+# ============================================================
+# Global configuration
+# ============================================================
+
+# Paths to Common Voice data
 DATA_ROOT = Path('cv-corpus-23.0-2025-09-05/en')
 CLIPS_DIR = DATA_ROOT / 'clips'
 TSV_PATH = DATA_ROOT / 'validated.tsv'
 
+# Audio & feature parameters
 SAMPLE_RATE = 16000
 N_MELS = 64
 WIN_LENGTH = 400
 HOP_LENGTH = 160
+DURATION = 6.0  # seconds per clip
 
+# Training hyperparameters
 BATCH_SIZE = 256
-EMBED_DIM = 512      # confirmed by you
-PROJ_DIM = 128
+EMBED_DIM = 512      # dimensionality of encoder output
+PROJ_DIM = 128       # projection head output (contrastive space)
 EPOCHS = 10
 LR = 1e-3
 TEMPERATURE = 0.07
+
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-SUBSET_SPEAKERS = None   # None or integer to debug quickly
-DURATION = 3.0           # seconds used for Mel extraction
+# Closed-set probe configuration
+CLOSED_SET_TEST_FRAC = 0.2
+MIN_UTTS_FOR_SPLIT = 2
 
-# Closed-set probe config
-CLOSED_SET_TEST_FRAC = 0.2   # fraction of utterances per train-speaker held-out for closed-set probe
-MIN_UTTS_FOR_SPLIT = 2       # need >=2 utterances per speaker to split off test utterances
-
+# Output directory
 OUTPUT_DIR = Path('results_simclr')
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+# Reproducibility
 SEED = 0
 random.seed(SEED)
 np.random.seed(SEED)
@@ -65,13 +127,16 @@ torch.manual_seed(SEED)
 
 tic = time.perf_counter()
 
-# --------------------
-# Read metadata and speaker splits
-# --------------------
+# ============================================================
+# Metadata loading and preprocessing
+# ============================================================
+
 metadata = pd.read_csv(TSV_PATH, sep='\t')
 print('Raw metadata rows:', len(metadata))
 
-# standardize accent column
+# ---- Standardize demographic columns ----
+
+# Accent may appear under different column names
 if 'accent' in metadata.columns:
     metadata['accent'] = metadata['accent'].fillna('unknown').astype(str)
 elif 'accents' in metadata.columns:
@@ -84,13 +149,15 @@ else:
 metadata['gender'] = metadata['gender'].fillna('unknown').str.lower()
 metadata['age'] = metadata['age'].fillna('unknown').str.lower()
 
-# keep only available audio files
+# ---- Remove samples with missing audio ----
 metadata['full_path'] = metadata['path'].apply(lambda p: str(CLIPS_DIR / p))
-metadata = metadata[metadata['full_path'].apply(lambda p: os.path.exists(p))]
+metadata = metadata[metadata['full_path'].apply(os.path.exists)]
 print('After filtering missing files:', len(metadata))
 
-# collapse age groups
+# ---- Collapse raw age labels into coarse groups ----
+
 def collapse_age(age):
+    """Map heterogeneous age strings into coarse age groups."""
     if pd.isna(age):
         return 'unknown'
     a = str(age).lower()
@@ -106,180 +173,154 @@ def collapse_age(age):
 
 metadata['age_group'] = metadata['age'].apply(collapse_age)
 
-# mapping accents into groups
+# ---- Accent grouping (explicit, interpretable groups) ----
+
 def map_accent_to_7(acc):
+    """Map free-text accent labels to a small, interpretable set."""
     if pd.isna(acc) or str(acc).strip() == "":
         return "unknown"
     s = str(acc).lower()
-    if "united states" in s or "united states english" in s or "american" in s or "us " in s or "usa" in s or "midwestern" in s:
+
+    if any(k in s for k in ["united states", "american", "usa", "us "]):
         return "usa"
-    if "england" in s or "liverpool" in s or "lancashire" in s:
+    if any(k in s for k in ["england", "liverpool", "lancashire"]):
         return "england"
-    if "scottish" in s or "scotland" in s or "irish" in s or "northern irish" in s or "northern ireland" in s or "wales" in s or "welsh" in s:
+    if any(k in s for k in ["scotland", "scottish", "irish", "wales", "welsh"]):
         return "other_uk"
-    if "canada" in s or "canadian" in s:
+    if "canada" in s:
         return "canada"
-    if "australia" in s or "australian" in s or "new zealand" in s or "nz" in s:
+    if any(k in s for k in ["australia", "new zealand", "nz"]):
         return "australia_nz"
-    if "india" in s or "south asia" in s or "pakistan" in s or "sri lanka" in s:
+    if any(k in s for k in ["india", "south asia", "pakistan", "sri lanka"]):
         return "india_south_asia"
-    return "other"
+
+    # Everything else is excluded from accent probes
+    return "unknown"
 
 metadata['accent_group'] = metadata['accent'].apply(map_accent_to_7)
 metadata['speaker_id'] = metadata['client_id'].astype(str)
 
-if SUBSET_SPEAKERS is not None:
-    speakers = metadata['speaker_id'].unique().tolist()
-    chosen = set(random.sample(speakers, SUBSET_SPEAKERS))
-    metadata = metadata[metadata['speaker_id'].isin(chosen)]
-    print('Subset rows:', len(metadata))
+# ---- Speaker-disjoint train/val/test split ----
 
-# create speaker-level split: train/val/test disjoint by speakers
 speakers = metadata['speaker_id'].unique()
 train_spk, test_spk = train_test_split(speakers, test_size=0.2, random_state=SEED)
 val_spk, test_spk = train_test_split(test_spk, test_size=0.5, random_state=SEED)
-print('Speakers total:', len(speakers), 'train/val/test:', len(train_spk), len(val_spk), len(test_spk))
 
 metadata['split'] = 'train'
 metadata.loc[metadata['speaker_id'].isin(val_spk), 'split'] = 'val'
 metadata.loc[metadata['speaker_id'].isin(test_spk), 'split'] = 'test'
 
+print('Speakers total:', len(speakers))
+print('Train / Val / Test speakers:', len(train_spk), len(val_spk), len(test_spk))
+
 metadata.to_csv(OUTPUT_DIR / 'commonvoice_metadata_processed.csv', index=False)
 
+# ============================================================
+# Dataset and augmentation
+# ============================================================
+
 class SpecAugment(nn.Module):
-    """
-    SpecAugment for log-Mel spectrograms.
-    Input shape: [1, n_mels, time]
-    """
-    def __init__(
-        self,
-        time_mask_param=30,
-        freq_mask_param=8,
-        num_time_masks=2,
-        num_freq_masks=2,
-        p=1.0
-    ):
+    """Apply time and frequency masking to log-Mel spectrograms."""
+
+    def __init__(self, time_mask_param=30, freq_mask_param=8, p=1.0):
         super().__init__()
         self.p = p
-        self.time_masks = nn.ModuleList(
-            [T.TimeMasking(time_mask_param) for _ in range(num_time_masks)]
-        )
-        self.freq_masks = nn.ModuleList(
-            [T.FrequencyMasking(freq_mask_param) for _ in range(num_freq_masks)]
-        )
+        self.time_mask = T.TimeMasking(time_mask_param)
+        self.freq_mask = T.FrequencyMasking(freq_mask_param)
 
     def forward(self, spec):
         if torch.rand(1).item() > self.p:
             return spec
+        return self.freq_mask(self.time_mask(spec))
 
-        for tm in self.time_masks:
-            spec = tm(spec)
-        for fm in self.freq_masks:
-            spec = fm(spec)
-        return spec
 
 class SimCLRCommonVoiceDataset(Dataset):
-    def __init__(
-        self,
-        df,
-        clips_dir,
-        split='train',
-        sample_rate=16000,
-        duration=3.0,
-        apply_specaug=True
-    ):
+    """
+    Dataset that returns two augmented views of speech from the same speaker,
+    which is required for contrastive learning with SimCLR.
+    """
+
+    def __init__(self, df, split, apply_specaug=True):
         self.df = df[df['split'] == split].reset_index(drop=True)
-        self.clips_dir = clips_dir
-        self.sample_rate = sample_rate
-        self.target_len = int(duration * sample_rate)
+        self.sample_rate = SAMPLE_RATE
+        self.target_len = int(DURATION * SAMPLE_RATE)
+
+        # Index utterances per speaker for positive pair sampling
+        self.indices_by_speaker = defaultdict(list)
+        for i, spk in enumerate(self.df['speaker_id']):
+            self.indices_by_speaker[spk].append(i)
 
         self.mel = T.MelSpectrogram(
-            sample_rate=sample_rate,
+            sample_rate=SAMPLE_RATE,
             n_fft=512,
             win_length=WIN_LENGTH,
             hop_length=HOP_LENGTH,
             n_mels=N_MELS
         )
-        self.amplitude_to_db = T.AmplitudeToDB()
+        self.db = T.AmplitudeToDB()
 
         self.specaug = SpecAugment() if apply_specaug and split == 'train' else None
 
     def __len__(self):
         return len(self.df)
 
-    def load_audio(self, path):
+    def _load_and_crop(self, path):
+        """Load waveform and apply random crop or zero-padding."""
         wav, sr = sf.read(path, dtype='float32')
         if wav.ndim > 1:
             wav = wav.mean(axis=1)
-
-        if sr != self.sample_rate:
-            wav = librosa.resample(wav, orig_sr=sr, target_sr=self.sample_rate)
-
+        if sr != SAMPLE_RATE:
+            wav = librosa.resample(wav, sr, SAMPLE_RATE)
         wav = torch.from_numpy(wav)
 
-        # random crop or pad (simple + fast)
         if wav.numel() > self.target_len:
             start = torch.randint(0, wav.numel() - self.target_len + 1, (1,)).item()
             wav = wav[start:start + self.target_len]
         else:
-            pad = self.target_len - wav.numel()
-            wav = F.pad(wav, (0, pad))
+            wav = F.pad(wav, (0, self.target_len - wav.numel()))
+        return wav.unsqueeze(0)
 
-        return wav.unsqueeze(0)  # [1, T]
-
-    def waveform_to_mel(self, waveform):
-        spec = self.mel(waveform)          # [1, n_mels, time]
-        spec = self.amplitude_to_db(spec)
-        spec = (spec - spec.mean()) / (spec.std() + 1e-6)
-        return spec
+    def _wav_to_mel(self, wav):
+        spec = self.db(self.mel(wav))
+        return (spec - spec.mean()) / (spec.std() + 1e-6)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        waveform = self.load_audio(row['full_path'])
+        spk = row['speaker_id']
 
-        s1 = self.waveform_to_mel(waveform)
-        s2 = self.waveform_to_mel(waveform)
+        # View 1
+        wav1 = self._load_and_crop(row['full_path'])
 
-        if self.specaug is not None:
+        # View 2: different utterance from same speaker if possible
+        idxs = self.indices_by_speaker[spk]
+        if len(idxs) > 1:
+            idx2 = random.choice([i for i in idxs if i != idx])
+            wav2 = self._load_and_crop(self.df.iloc[idx2]['full_path'])
+        else:
+            wav2 = wav1.clone()
+
+        s1 = self._wav_to_mel(wav1)
+        s2 = self._wav_to_mel(wav2)
+
+        if self.specaug:
             s1 = self.specaug(s1)
             s2 = self.specaug(s2)
 
-        return (
-            s1.squeeze(0),  # [n_mels, time]
-            s2.squeeze(0),
-            row['speaker_id'],
-            row['gender'],
-            row['age_group'],
-            row['accent_group'],
-            row.get('sentence', "")
-        )
+        return s1.squeeze(0), s2.squeeze(0), spk, row['gender'], row['age_group'], row['accent_group']
 
-def collate_fn(batch):
-    s1 = torch.stack([b[0] for b in batch]).unsqueeze(1).float()
-    s2 = torch.stack([b[1] for b in batch]).unsqueeze(1).float()
-    return (
-        s1,
-        s2,
-        [b[2] for b in batch],
-        [b[3] for b in batch],
-        [b[4] for b in batch],
-        [b[5] for b in batch],
-        [b[6] for b in batch],
-    )
+# ============================================================
+# Encoder, projection head, and loss
+# ============================================================
 
-# --------------------
-# Encoder & projection head
-# --------------------
 class ConvBlock(nn.Module):
+    """Two-layer convolutional block with batch norm and pooling."""
     def __init__(self, in_ch, out_ch, pool=True):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)
         )
         self.pool = nn.MaxPool2d(2) if pool else nn.Identity()
 
@@ -287,52 +328,44 @@ class ConvBlock(nn.Module):
         return self.pool(self.conv(x))
 
 class SmallCNNEncoder(nn.Module):
-    def __init__(self, embed_dim=EMBED_DIM):
+    """CNN encoder that outputs L2-normalized speaker embeddings."""
+    def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            ConvBlock(1, 32),
-            ConvBlock(32, 64),
-            ConvBlock(64, 128),
-            ConvBlock(128, 256, pool=False),
+            ConvBlock(1, 32), ConvBlock(32, 64),
+            ConvBlock(64, 128), ConvBlock(128, 256, pool=False)
         )
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(256, embed_dim)
+        self.fc = nn.Linear(256 * 2, EMBED_DIM)
 
     def forward(self, x):
         z = self.net(x)
-        z = self.pool(z).squeeze(-1).squeeze(-1)
+        z = z.flatten(2)
+        z = torch.cat([z.mean(-1), z.std(-1)], dim=1)
         z = self.fc(z)
-        z = F.normalize(z, dim=-1)
-        return z
+        return F.normalize(z, dim=-1)
 
 class ProjectionHead(nn.Module):
-    def __init__(self, in_dim=512, proj_dim=128):
+    """MLP projection head used only during contrastive training."""
+    def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, in_dim),
-            nn.BatchNorm1d(in_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_dim, in_dim),
-            nn.BatchNorm1d(in_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_dim, proj_dim),
+            nn.Linear(EMBED_DIM, EMBED_DIM), nn.BatchNorm1d(EMBED_DIM), nn.ReLU(),
+            nn.Linear(EMBED_DIM, EMBED_DIM), nn.BatchNorm1d(EMBED_DIM), nn.ReLU(),
+            nn.Linear(EMBED_DIM, PROJ_DIM)
         )
 
     def forward(self, x):
         return self.net(x)
 
-
-def nt_xent_loss(z1, z2, temperature=TEMPERATURE):
-    batch_size = z1.size(0)
+def nt_xent_loss(z1, z2):
+    """Normalized temperature-scaled cross entropy loss (SimCLR)."""
+    B = z1.size(0)
     z = torch.cat([z1, z2], dim=0)
-    sim = torch.matmul(z, z.t())
-    mask = (~torch.eye(2 * batch_size, 2 * batch_size, dtype=torch.bool)).to(z.device)
-    sim = sim / temperature
+    sim = torch.matmul(z, z.T) / TEMPERATURE
+    mask = ~torch.eye(2 * B, dtype=torch.bool, device=z.device)
     exp_sim = torch.exp(sim) * mask
-    positives = torch.cat([torch.diag(sim, batch_size), torch.diag(sim, -batch_size)], dim=0)
-    denom = exp_sim.sum(dim=1)
-    loss = -torch.log(torch.exp(positives) / denom)
-    return loss.mean()
+    pos = torch.cat([torch.diag(sim, B), torch.diag(sim, -B)])
+    return (-torch.log(torch.exp(pos) / exp_sim.sum(dim=1))).mean()
 
 # --------------------
 # DataLoaders for SimCLR training (train/val)

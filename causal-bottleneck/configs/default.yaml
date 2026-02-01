@@ -1,0 +1,19 @@
+seed: 0
+device: cuda
+
+encoder:
+  embed_dim: 256
+
+bottleneck:
+  k_values: [32, 64, 96]
+  lambda_orth: 1.0
+
+adversary:
+  gender: [0.01, 0.1]
+  age: [0.01]
+  accent: [0.01]
+
+training:
+  epochs: 10
+  batch_size: 64
+  lr: 1e-3
